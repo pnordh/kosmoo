@@ -13,9 +13,9 @@ import (
 	"github.com/daimler/kosmoo/pkg/metrics"
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
+	"github.com/gophercloud/utils/openstack/clientconfig"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/ini.v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -25,7 +25,7 @@ import (
 var (
 	refreshInterval = flag.Int64("refresh-interval", 120, "Interval between scrapes to OpenStack API (default 120s)")
 	addr            = flag.String("addr", ":9183", "Address to listen on")
-	cloudConfFile   = flag.String("cloud-conf", "", "path to the cloud.conf file. If this path is not set the scraper will use the usual OpenStack environment variables.")
+	osCloud         = flag.String("cloud", "", "Which cloud (from clouds.yaml) should be used. If this is not set the scraper will try to use the usual OpenStack environment variables.")
 	kubeconfig      = flag.String("kubeconfig", os.Getenv("KUBECONFIG"), "Path to the kubeconfig file to use for CLI requests. (uses in-cluster config if empty)")
 	metricsPrefix   = flag.String("metrics-prefix", metrics.DefaultMetricsPrefix, "Prefix used for all metrics")
 )
@@ -123,12 +123,18 @@ func run() error {
 	var err error
 
 	// get OpenStack credentials
-	if *cloudConfFile != "" {
-		authOpts, endpointOpts, err = authOptsFromCloudConf(*cloudConfFile)
+	if *osCloud != "" {
+		// This will try to load auth options for the given cloud in a clouds.yaml file
+		// in all the usual locations.
+		// See https://github.com/gophercloud/utils/blob/8e7800759d1638be1f2404f34a44109a502f19f2/openstack/clientconfig/utils.go#L96-L119
+		ao, err := clientconfig.AuthOptions(&clientconfig.ClientOpts{
+			Cloud: *osCloud,
+		})
 		if err != nil {
-			return logError("unable to read OpenStack credentials from cloud.conf: %v", err)
+			return logError("unable to read OpenStack credentials from clouds.yaml: %v", err)
 		}
-		klog.Infof("OpenStack credentials read from cloud.conf file at %s", *cloudConfFile)
+		authOpts = *ao
+		klog.Infof("OpenStack credentials read from clouds.yaml")
 	} else {
 		authOpts, err = openstack.AuthOptionsFromEnv()
 		if err != nil {
@@ -143,6 +149,13 @@ func run() error {
 		klog.Info("OpenStack credentials read from environment")
 	}
 
+	// authenticate to OpenStack
+	provider, err := openstack.AuthenticatedClient(authOpts)
+	if err != nil {
+		return logError("unable to authenticate to OpenStack: %v", err)
+	}
+	klog.Infof("OpenStack authentication was successful")
+
 	// get kubernetes clientset
 	var config *rest.Config
 	config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
@@ -154,15 +167,6 @@ func run() error {
 		return logError("error creating kubernetes Clientset: %v", err)
 	}
 
-	// authenticate to OpenStack
-	provider, err := openstack.AuthenticatedClient(authOpts)
-	if err != nil {
-		return logError("unable to authenticate to OpenStack: %v", err)
-	}
-	_ = provider
-
-	klog.Infof("OpenStack authentication was successful: username=%s, tenant-id=%s, tenant-name=%s", authOpts.Username, authOpts.TenantID, authOpts.TenantName)
-
 	// start scraping loop
 	for {
 		err := updateMetrics(provider, endpointOpts, clientset, authOpts.TenantID)
@@ -171,57 +175,6 @@ func run() error {
 		}
 		time.Sleep(time.Second * time.Duration(*refreshInterval))
 	}
-}
-
-// original struct is in
-// "github.com/kubernetes/kubernetes/pkg/cloudprovider/providers/openstack"
-// and read by
-// "gopkg.in/gcfg.v1"
-// maybe use that to be type-safe
-
-// For Reference, the layout of the [Global] section in cloud.conf
-// 	Global struct {
-// 		AuthURL    string `gcfg:"auth-url"`
-// 		Username   string
-// 		UserID     string `gcfg:"user-id"`
-// 		Password   string
-// 		TenantID   string `gcfg:"tenant-id"`
-// 		TenantName string `gcfg:"tenant-name"`
-// 		TrustID    string `gcfg:"trust-id"`
-// 		DomainID   string `gcfg:"domain-id"`
-// 		DomainName string `gcfg:"domain-name"`
-// 		Region     string
-// 		CAFile     string `gcfg:"ca-file"`
-// 	}
-
-// authOptsFromCloudConf reads the cloud.conf from `path` and returns the read AuthOptions
-func authOptsFromCloudConf(path string) (gophercloud.AuthOptions, gophercloud.EndpointOpts, error) {
-	cfg, err := ini.Load(path)
-	if err != nil {
-		return gophercloud.AuthOptions{}, gophercloud.EndpointOpts{}, fmt.Errorf("unable to read cloud.conf content: %v", err)
-	}
-
-	global, err := cfg.GetSection("Global")
-	if err != nil {
-		return gophercloud.AuthOptions{}, gophercloud.EndpointOpts{}, fmt.Errorf("unable get Global section: %v", err)
-	}
-
-	ao := gophercloud.AuthOptions{
-		IdentityEndpoint: global.Key("auth-url").String(),
-		Username:         global.Key("username").String(),
-		UserID:           global.Key("user-id").String(),
-		Password:         global.Key("password").String(),
-		DomainID:         global.Key("domain-id").String(),
-		DomainName:       global.Key("domain-name").String(),
-		TenantID:         global.Key("tenant-id").String(),
-		TenantName:       global.Key("tenant-name").String(),
-		AllowReauth:      true,
-	}
-	eo := gophercloud.EndpointOpts{
-		Region: global.Key("region").String(),
-	}
-
-	return ao, eo, nil
 }
 
 func updateMetrics(provider *gophercloud.ProviderClient, eo gophercloud.EndpointOpts, clientset *kubernetes.Clientset, tenantID string) error {
